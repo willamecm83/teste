@@ -7,6 +7,11 @@ on:
     branches:
       - main
 
+permissions:
+  contents: write   # necessário para criar tags e releases
+  issues: write     # necessário para criar labels via API
+  pull-requests: read # para ler labels dos PRs
+
 jobs:
   create-release:
     if: github.event.pull_request.merged == true
@@ -90,6 +95,24 @@ jobs:
           echo "Nova versão: $NEW_VERSION"
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
 
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          LAST_TAG=${{ steps.get_tag.outputs.tag }}
+          NEW_TAG=${{ steps.bump_version.outputs.new_version }}
+
+          echo "Gerando changelog entre $LAST_TAG...HEAD"
+
+          if [ "$LAST_TAG" = "v1.0.0" ] && ! git rev-parse v1.0.0 >/dev/null 2>&1; then
+            git log --pretty=format:"- %s (%h)" > CHANGELOG.md
+          else
+            git log $LAST_TAG..HEAD --pretty=format:"- %s (%h)" > CHANGELOG.md
+          fi
+
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          cat CHANGELOG.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
       - name: Create Git Tag
         run: |
           git config user.name "github-actions[bot]"
@@ -104,8 +127,12 @@ jobs:
           name: "Release ${{ steps.bump_version.outputs.new_version }}"
           body: |
             🚀 Release automático gerado após merge do PR na main.
-            - Autor: ${{ github.actor }}
-            - PR: #${{ github.event.pull_request.number }}
-            - Tipo de versão: **${{ steps.bump_type.outputs.bump }}**
+
+            **Tipo de versão:** ${{ steps.bump_type.outputs.bump }}
+            **Autor:** ${{ github.actor }}
+            **PR:** #${{ github.event.pull_request.number }}
+
+            ## 📌 Changelog
+            ${{ steps.changelog.outputs.changelog }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
