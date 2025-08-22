@@ -53,13 +53,93 @@ jobs:
         run: |
           TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v1.0.0")
           echo "Última tag encontrada: $TAG"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Decide bump type from labels
         id: bump_type
         run: |
-          LABELS="${{ toJson(github.event.pull_request.labels) }}"
-          echo "Labels do PR: $LABELS"
+          # Mostra as labels para debug (opcional)
+          echo "Labels do PR (raw):"
+          jq '.pull_request.labels' "$GITHUB_EVENT_PATH" || true
 
-          if echo "$LABELS" | grep -q '"name":"major"'; then
-            echo "bump=major" >> $GI
+          # padrão
+          BUMP="patch"
+
+          # se existir label major -> major
+          if jq -e '.pull_request.labels[]? | select(.name=="major")' "$GITHUB_EVENT_PATH" >/dev/null 2>&1; then
+            BUMP="major"
+          # se existir label minor -> minor
+          elif jq -e '.pull_request.labels[]? | select(.name=="minor")' "$GITHUB_EVENT_PATH" >/dev/null 2>&1; then
+            BUMP="minor"
+          fi
+
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version
+        id: bump_version
+        run: |
+          TAG=${{ steps.get_tag.outputs.tag }}
+          VERSION=${TAG#v}
+
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f2)
+          PATCH=$(echo $VERSION | cut -d. -f3)
+
+          BUMP=${{ steps.bump_type.outputs.bump }}
+          if [ "$BUMP" = "major" ]; then
+            MAJOR=$((MAJOR+1))
+            MINOR=0
+            PATCH=0
+          elif [ "$BUMP" = "minor" ]; then
+            MINOR=$((MINOR+1))
+            PATCH=0
+          else
+            PATCH=$((PATCH+1))
+          fi
+
+          NEW_VERSION="v$MAJOR.$MINOR.$PATCH"
+          echo "Nova versão: $NEW_VERSION"
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          LAST_TAG=${{ steps.get_tag.outputs.tag }}
+          NEW_TAG=${{ steps.bump_version.outputs.new_version }}
+
+          echo "Gerando changelog entre $LAST_TAG...HEAD"
+
+          if [ "$LAST_TAG" = "v1.0.0" ] && ! git rev-parse v1.0.0 >/dev/null 2>&1; then
+            git log --pretty=format:"- %s (%h)" > CHANGELOG.md
+          else
+            git log $LAST_TAG..HEAD --pretty=format:"- %s (%h)" > CHANGELOG.md
+          fi
+
+          # Usar delimitador único para evitar conflito com o conteúdo
+          echo "changelog<<__CHANGELOG__" >> "$GITHUB_OUTPUT"
+          cat CHANGELOG.md >> "$GITHUB_OUTPUT"
+          echo "__CHANGELOG__" >> "$GITHUB_OUTPUT"
+
+      - name: Create Git Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.bump_version.outputs.new_version }}
+          git push origin ${{ steps.bump_version.outputs.new_version }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.bump_version.outputs.new_version }}
+          name: "Release ${{ steps.bump_version.outputs.new_version }}"
+          body: |
+            🚀 Release automático gerado após merge do PR na main.
+
+            **Tipo de versão:** ${{ steps.bump_type.outputs.bump }}
+            **Autor:** ${{ github.actor }}
+            **PR:** #${{ github.event.pull_request.number }}
+
+            ## 📌 Changelog
+            ${{ steps.changelog.outputs.changelog }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
