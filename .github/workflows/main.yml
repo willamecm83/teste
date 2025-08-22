@@ -71,12 +71,12 @@ jobs:
           LAST_TAG=${{ steps.get_last_tag.outputs.last_tag }}
           echo "Gerando changelog entre $LAST_TAG...HEAD"
 
+          # gera changelog
           git log $LAST_TAG..HEAD --pretty=format:"- %s (%h)" > CHANGELOG.md
 
-          # Corrigido: delimitador na primeira coluna, sem espaços
-          echo "changelog<<EOF" >> $GITHUB_OUTPUT
-          cat CHANGELOG.md >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          # transforma em string segura para output do GitHub Actions
+          CHANGELOG_CONTENT=$(jq -Rs '.' < CHANGELOG.md)
+          echo "changelog=$CHANGELOG_CONTENT" >> $GITHUB_OUTPUT
 
       - name: Create release
         uses: softprops/action-gh-release@v1
