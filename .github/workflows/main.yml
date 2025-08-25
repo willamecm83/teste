@@ -2,93 +2,149 @@ name: Release on PR merge
 
 on:
   pull_request:
-    types: [closed]
+    types:
+      - closed
     branches:
-      - main   # ✅ só roda quando o PR é mergeado na main
+      - main
+
+permissions:
+  contents: write      # criar tags e releases
+  issues: write        # criar labels
+  pull-requests: read  # ler labels do PR
 
 jobs:
-  release:
+  create-release:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
 
-      - name: Get last tag
-        id: get_last_tag
+      - name: Ensure labels exist (major, minor, patch)
         run: |
-          LAST_TAG=$(git describe --tags --abbrev=0 || echo "v0.0.0")
-          echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
+          for label in major minor patch; do
+            echo "Verificando label: $label"
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/labels/$label)
+
+            if [ "$RESPONSE" -eq 404 ]; then
+              echo "Label $label não existe. Criando..."
+              if [ "$label" = "major" ]; then COLOR="d73a4a"; DESC="Incrementa versão major"; fi
+              if [ "$label" = "minor" ]; then COLOR="fbca04"; DESC="Incrementa versão minor"; fi
+              if [ "$label" = "patch" ]; then COLOR="0e8a16"; DESC="Incrementa versão patch"; fi
+
+              curl -s -X POST \
+                -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                https://api.github.com/repos/${{ github.repository }}/labels \
+                -d "{\"name\":\"$label\",\"color\":\"$COLOR\",\"description\":\"$DESC\"}"
+            else
+              echo "Label $label já existe."
+            fi
+          done
+
+      - name: Get latest tag
+        id: get_tag
+        run: |
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v1.0.0")
+          echo "Última tag encontrada: $TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
 
       - name: Decide bump type from labels
         id: bump_type
         run: |
-          LABELS=$(echo '${{ toJson(github.event.pull_request.labels) }}')
-          echo "Labels do PR: $LABELS"
+          LABELS_JSON='${{ toJson(github.event.pull_request.labels) }}'
+          echo "Labels do PR: $LABELS_JSON"
 
-          BUMP="patch" # valor padrão
+          # Extrai os nomes dos labels (array simples)
+          LABEL_NAMES=$(echo "$LABELS_JSON" | jq -r '.[].name')
 
-          if echo "$LABELS" | grep -q '"name": *"major"'; then
-            BUMP="major"
-          elif echo "$LABELS" | grep -q '"name": *"minor"'; then
-            BUMP="minor"
+          echo "Nomes dos labels: $LABEL_NAMES"
+
+          if echo "$LABEL_NAMES" | grep -q "major"; then
+            echo "bump=major" >> $GITHUB_OUTPUT
+          elif echo "$LABEL_NAMES" | grep -q "minor"; then
+            echo "bump=minor" >> $GITHUB_OUTPUT
+          else
+            echo "bump=patch" >> $GITHUB_OUTPUT
           fi
-
-          echo "bump=$BUMP" >> $GITHUB_OUTPUT
 
       - name: Bump version
         id: bump_version
         run: |
-          LAST_TAG=${{ steps.get_last_tag.outputs.last_tag }}
+          TAG=${{ steps.get_tag.outputs.tag }}
+          VERSION=${TAG#v}
+
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f2)
+          PATCH=$(echo $VERSION | cut -d. -f3)
+
           BUMP=${{ steps.bump_type.outputs.bump }}
-
-          IFS='.' read -r major minor patch <<< "${LAST_TAG#v}"
-
-          case $BUMP in
-            major)
-              major=$((major+1))
-              minor=0
-              patch=0
-              ;;
-            minor)
-              minor=$((minor+1))
-              patch=0
-              ;;
-            patch)
-              patch=$((patch+1))
-              ;;
-          esac
-
-          NEW_TAG="v$major.$minor.$patch"
-
-          # checa se tag já existe
-          if git rev-parse "$NEW_TAG" >/dev/null 2>&1; then
-            echo "Tag $NEW_TAG already exists, skipping release."
-            exit 0
+          if [ "$BUMP" = "major" ]; then
+            MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0
+          elif [ "$BUMP" = "minor" ]; then
+            MINOR=$((MINOR+1)); PATCH=0
+          else
+            PATCH=$((PATCH+1))
           fi
 
-          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          NEW_VERSION="v$MAJOR.$MINOR.$PATCH"
+          echo "Nova versão: $NEW_VERSION"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
 
-      - name: Generate changelog
+      - name: Generate Changelog
         id: changelog
         run: |
-          LAST_TAG=${{ steps.get_last_tag.outputs.last_tag }}
+          set -eo pipefail
+
+          LAST_TAG=${{ steps.get_tag.outputs.tag }}
           echo "Gerando changelog entre $LAST_TAG...HEAD"
 
-          git log $LAST_TAG..HEAD --pretty=format:"- %s (%h)" > CHANGELOG.md
+          if git rev-parse "$LAST_TAG" >/dev/null 2>&1; then
+            RANGE="$LAST_TAG..HEAD"
+          else
+            RANGE="HEAD"
+          fi
 
-          # transforma em string segura
-          CHANGELOG_CONTENT=$(jq -Rs '.' < CHANGELOG.md)
-          echo "changelog=$CHANGELOG_CONTENT" >> $GITHUB_OUTPUT
+          git log $RANGE --no-merges --pretty=format:"- %s (%h)" > CHANGELOG.md || true
 
-      - name: Create release
+          if [ ! -s CHANGELOG.md ]; then
+            echo "- Sem mudanças desde $LAST_TAG" > CHANGELOG.md
+          fi
+
+          DELIM="EOF_$(date +%s)"
+          {
+            echo "changelog<<$DELIM"
+            cat CHANGELOG.md
+            echo
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Git Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.bump_version.outputs.new_version }}
+          git push origin ${{ steps.bump_version.outputs.new_version }}
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ steps.bump_version.outputs.new_tag }}
-          name: Release ${{ steps.bump_version.outputs.new_tag }}
-          body: ${{ steps.changelog.outputs.changelog }}
+          tag_name: ${{ steps.bump_version.outputs.new_version }}
+          name: "Release ${{ steps.bump_version.outputs.new_version }}"
+          body: |
+            🚀 Release automático gerado após merge do PR na main.
+
+            **Tipo de versão:** ${{ steps.bump_type.outputs.bump }}
+            **Autor:** ${{ github.actor }}
+            **PR:** #${{ github.event.pull_request.number }}
+
+            ## 📌 Changelog
+            ${{ steps.changelog.outputs.changelog }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PERSONAL_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
